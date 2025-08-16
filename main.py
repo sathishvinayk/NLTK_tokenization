@@ -1,12 +1,38 @@
 import requests
+import time
 from bs4 import BeautifulSoup
 import re
 import os
 import nltk
-from nltk.tokenize import RegexpTokenizer, sent_tokenize, word_tokenize
+from nltk.tokenize import RegexpTokenizer, sent_tokenize
 from nltk.corpus import stopwords
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from functools import lru_cache
+from tenacity import retry, stop_after_attempt, wait_exponential
+from tqdm import tqdm
 
+CONFIG = {
+    'STOPWORDS_DIRECTORY': 'StopWords',
+    'POSITIVE_DICT': 'MasterDictionary/positive-words.txt',
+    'NEGATIVE_DICT': 'MasterDictionary/negative-words.txt',
+    'INPUT_FILE': 'Input.xlsx',
+    'OUTPUT_FILE': 'Output.xlsx',
+    'MAX_WORKERS': 5,
+    'REQUEST_DELAY': 1.5,
+    'MAX_RETRIES': 3
+}
+
+# Thread-safe Excel writer
+excel_lock = threading.Lock()
+
+def format_metric_name(name):
+    """Format metric names for output"""
+    return name.replace('_', ' ').upper()
+
+@retry(stop=stop_after_attempt(CONFIG['max_retries']), 
+       wait=wait_exponential(multiplier=1, min=4, max=10))
 def setup_nltk():
     """Ensure all required NLTK resources are available"""
     try:
@@ -17,6 +43,7 @@ def setup_nltk():
             print("Downloading NLTK stopwords...")
             nltk.download('stopwords')
         
+        # PUNKT_TAB is required, Sometimes its not working (adding this just in case)
         # Download punkt for sentence tokenization
         try:
             nltk.data.find('tokenizers/punkt')
@@ -33,25 +60,6 @@ def setup_nltk():
     except Exception as e:
         print(f"Error during NLTK setup: {e}")
         raise  # Re-raise the exception to stop execution if setup fails
-
-# Initialize NLTK
-setup_nltk()
-
-def read_urls_from_excel(file_path, url_col='URL', url_id_col='URL_ID'):
-    try:
-        # Read the Excel file
-        df = pd.read_excel(file_path)
-        
-        # Extract URL and URL_ID columns
-        urls = df[url_col].tolist()
-        url_ids = df[url_id_col].tolist()
-        
-        # Return as list of tuples
-        return list(zip(urls, url_ids))
-    
-    except Exception as e:
-        print(f"Error reading Excel file: {e}")
-        return []
 
 def clean_text(text, stop_words):
     """Clean text using regex tokenizer (no punkt dependency)"""
@@ -70,20 +78,30 @@ def clean_text(text, stop_words):
 def load_stop_words(stop_words_dir):
     stop_words = set()
     for filename in os.listdir(stop_words_dir):
-        if filename.endswith('.txt'):
-            with open(os.path.join(stop_words_dir, filename), 'r', encoding='utf-8', errors='ignore') as file:
-                stop_words.update(set(file.read().split()))
-    return stop_words
+        try:
+            if filename.endswith('.txt'):
+                with open(os.path.join(stop_words_dir, filename), 'r', encoding='utf-8', errors='ignore') as file:
+                    stop_words.update(set(file.read().split()))
+        except Exception as e:
+            print(f"⚠️ Error loading {filename}: {e}")
+    return frozenset(stop_words) # Just in case for thread safety
 
 def load_master_dictionary(positive_file, negative_file, stop_words):
-    with open(positive_file, 'r', encoding='utf-8', errors='ignore') as file:
-        positive_words = set(word.strip() for word in file.read().split() if word.strip() not in stop_words)
+    try:
+        with open(positive_file, 'r', encoding='utf-8', errors='ignore') as file:
+            positive_words = set(word.strip() for word in file.read().split() if word.strip() not in stop_words)
+    except Exception as e:
+            print(f"⚠️ Error loading {positive_file}: {e}")    
 
-    with open(negative_file, 'r', encoding='utf-8', errors='ignore') as file:
-        negative_words = set(word.strip() for word in file.read().split() if word.strip() not in stop_words)
+    try:
+        with open(negative_file, 'r', encoding='utf-8', errors='ignore') as file:
+            negative_words = set(word.strip() for word in file.read().split() if word.strip() not in stop_words)
+    except Exception as e:
+        print(f"⚠️ Error loading {negative_file}: {e}")    
 
     return positive_words, negative_words
 
+@lru_cache(maxsize=10000)
 def count_syllables(word):
     """Count syllables in a word"""
     word = word.lower()
@@ -161,10 +179,10 @@ def calculate_readability_scores(text, tokens):
         'avg_sentence_length': avg_sentence_length,
         'percentage_complex_words': percentage_complex,
         'fog_index': fog_index,
-        'avg_words_per_sentence': avg_words_per_sentence,
+        'avg_number_of_words_per_sentence': avg_words_per_sentence,
         'complex_word_count': num_complex_words,
         'word_count': word_count,
-        'avg_syllables_per_word': avg_syllables_per_word,
+        'syllables_per_word': avg_syllables_per_word,
         'personal_pronouns': personal_pronouns,
         'avg_word_length': avg_word_length
     }
@@ -183,12 +201,14 @@ def calculate_sentiment_scores(tokens, positive_words, negative_words):
         'subjectivity_score': subjectivity_score,
     }
 
+@retry(stop=stop_after_attempt(CONFIG['max_retries']),
+       wait=wait_exponential(multiplier=1, min=2, max=10))
 def extract_article(url):
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0'
         }
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()  # Raise an exception for HTTP errors
 
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -206,18 +226,22 @@ def extract_article(url):
         return title, article_text
 
     except Exception as e:
-        print(f"Error extracting article: {e}")
+        print(f"⚠️ Error extracting article: {e}")
         return None, None
 
 def analyze_article(url, url_id, stop_words, positive_words, negative_words):
-    title, text = extract_article(url)
-    if title and text:
+    try:
+        title, text = extract_article(url)
+        if not text:
+            return None
+
         cleaned_tokens = clean_text(text, stop_words)
+
+        if not cleaned_tokens:
+            return None
         
         # Calculate sentiment scores
         sentiment_scores = calculate_sentiment_scores(cleaned_tokens, positive_words, negative_words) # Until u understood
-        
-        # ------ XXXXX ------# 
 
         # Calculate readability scores
         readability_scores = calculate_readability_scores(text, cleaned_tokens) # FROM point 2
@@ -232,23 +256,78 @@ def analyze_article(url, url_id, stop_words, positive_words, negative_words):
         }
         
         return results
-    else:
-        print(f"Failed to extract article from {url}")
+    except Exception as e:
+        print(f"⚠️ Analysis failed for {url_id}: {e}")
         return None
+    
+def read_urls_from_excel(file_path, url_col='URL', url_id_col='URL_ID'):
+    try:
+        # Read the Excel file
+        df = pd.read_excel(file_path)
+        
+        # Extract URL and URL_ID columns
+        urls = df[url_col].tolist()
+        url_ids = df[url_id_col].tolist()
+        
+        # Return as list of tuples
+        return list(zip(url_ids, urls))
+    
+    except Exception as e:
+        print(f"Error reading Excel file: {e}")
+        return []
+    
+# Add this function to handle Excel output
+def save_to_excel(results, output_file='output.xlsx'):
+    """Save results to Excel file, appending if file exists"""
+    try:
+        # Convert results to DataFrame
+        df_new = pd.DataFrame([results])
+        
+        # Format column names (uppercase without underscores)
+        df_new.columns = [format_metric_name(col) for col in df_new.columns]
+        
+        # Try to read existing file
+        try:
+            df_existing = pd.read_excel(output_file)
+            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+            print(f"📊 Loaded {len(df_existing)} existing records and merging new record with URL_ID={results['url_id']}")
+        except FileNotFoundError:
+            df_combined = df_new
+        
+        # Save to Excel
+        df_combined.to_excel(output_file, index=False)
+    except Exception as e:
+        print(f"⚠️ Error saving to Excel: {e}")
+
+def main():
+    """Main execution flow"""
+    print("🚀 Initializing Text Analyzer")
+
+    #Remove any old output file if exists (Instead of maintaining duplicates)
+    if os.path.exists(CONFIG['OUTPUT_FILE']):
+        os.remove(CONFIG['OUTPUT_FILE'])
+        print(f"🗑️ Removed existing {CONFIG['OUTPUT_FILE']}, starting fresh...")
+
+    stop_words = load_stop_words(CONFIG['STOPWORDS_DIRECTORY'])
+    positive_words, negative_words = load_master_dictionary(CONFIG['POSITIVE_DICT'], CONFIG['NEGATIVE_DICT'], stop_words)
+
+    read_data = read_urls_from_excel(CONFIG['INPUT_FILE'])
+    # print(read_data)
+
+    print("Starting to process!")
+    for x in read_data:
+        
+        url_id = x[0] #Indexing
+        url = x[1] #Indexing
+        time.sleep(2)
+        results = analyze_article(url, url_id, stop_words, positive_words, negative_words)
+        if results:
+            save_to_excel(results, CONFIG['OUTPUT_FILE'])
+        else:
+            print("Error processing the results")
+
+    print(f"✅ Results saved to {CONFIG['OUTPUT_FILE']}")
+
 
 if __name__ == '__main__':
-    STOP_WORDS_DIR = 'StopWords'
-    POSITIVE_DICT = 'MasterDictionary/positive-words.txt'
-    NEGATIVE_DICT = 'MasterDictionary/negative-words.txt'
-
-    url = "https://insights.blackcoffer.com/ai-and-ml-based-youtube-analytics-and-content-creation-tool-for-optimizing-subscriber-engagement-and-content-strategy/"
-    url_id = "Netclan20241017"
-
-    stop_words = load_stop_words(STOP_WORDS_DIR)
-    positive_words, negative_words = load_master_dictionary(POSITIVE_DICT, NEGATIVE_DICT, stop_words)
-
-    results = analyze_article(url, url_id, stop_words, positive_words, negative_words)
-    if results:
-        print("Analysis Results:")
-        for key, value in results.items():
-            print(f"{key}: {value}")
+    main()

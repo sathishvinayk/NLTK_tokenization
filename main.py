@@ -243,7 +243,6 @@ def analyze_article(url, url_id, stop_words, positive_words, negative_words):
         results = {
             'url_id': url_id,
             'url': url,
-            'title': title,
             **sentiment_scores,
             **readability_scores
         }
@@ -268,45 +267,57 @@ def read_urls_from_excel(file_path, url_col='URL', url_id_col='URL_ID'):
     except Exception as e:
         print(f"Error reading Excel file: {e}")
         return []
+    
+def save_to_file(results, fileLength):
+    try:
+        # Saving once at the end
+        if results:
+            df = pd.DataFrame(results)
+            df.rename(columns={
+                col: format_metric_name(col) for col in df.columns
+                if col not in ['url_id', 'url', 'title']
+            }, inplace=True)
+            df.to_excel(CONFIG['OUTPUT_FILE'], index=False)
+            print(f"\n✅ Processing complete! Successfully processed {len(results)}/{fileLength} URLs")
+            print(f"📊 Results saved to {CONFIG['OUTPUT_FILE']}")
+        else:
+            print("\n⚠️ No results to save.")
+    except Exception as e:
+        print(f"Error writing Excel file: {e}")
+        return []
 
 def main():
-    """Main execution flow"""
-    print("🚀 Initializing Text Analyzer")
+    try:
+        """Main execution flow"""
+        print("🚀 Initializing Text Analyzer")
 
-    #Remove any old output file if exists (Instead of maintaining duplicates)
-    if os.path.exists(CONFIG['OUTPUT_FILE']):
-        os.remove(CONFIG['OUTPUT_FILE'])
-        print(f"🗑️ Removed existing {CONFIG['OUTPUT_FILE']}, starting fresh...")
+        #Remove any old output file if exists (Instead of maintaining duplicates)
+        if os.path.exists(CONFIG['OUTPUT_FILE']):
+            os.remove(CONFIG['OUTPUT_FILE'])
+            print(f"🗑️  Removed existing {CONFIG['OUTPUT_FILE']}, starting fresh...")
 
-    stop_words = load_stop_words(CONFIG['STOPWORDS_DIRECTORY'])
-    positive_words, negative_words = load_master_dictionary(CONFIG['POSITIVE_DICT'], CONFIG['NEGATIVE_DICT'], stop_words)
+        stop_words = load_stop_words(CONFIG['STOPWORDS_DIRECTORY'])
+        positive_words, negative_words = load_master_dictionary(CONFIG['POSITIVE_DICT'], CONFIG['NEGATIVE_DICT'], stop_words)
 
-    read_data = read_urls_from_excel(CONFIG['INPUT_FILE'])
-    if not read_data:
-        print("❌ No URLs found in input file")
-        return
+        read_data = read_urls_from_excel(CONFIG['INPUT_FILE'])
+        if not read_data:
+            print("❌ No URLs found in input file")
+            return
 
-    print(f" --> Processing {len(read_data)} URLs...")
-    results_list = []
+        print(f" --> Processing {len(read_data)} URLs...")
+        results_list = []
 
-    for url_id, url in tqdm(read_data, desc="Processing URLs"):
-        time.sleep(CONFIG['REQUEST_DELAY'])
-        result = analyze_article(url, url_id, stop_words, positive_words, negative_words)
-        if result:
-            results_list.append(result)
+        for url_id, url in tqdm(read_data, desc="Processing URLs"):
+            time.sleep(CONFIG['REQUEST_DELAY'])
+            result = analyze_article(url, url_id, stop_words, positive_words, negative_words)
+            if result:
+                results_list.append(result)
+        
+        save_to_file(results_list, len(read_data))
+    except Exception as e:
+        print(f"Error on the main function: {e}")
 
-    # Saving once at the end
-    if results_list:
-        df = pd.DataFrame(results_list)
-        df.rename(columns={
-            col: format_metric_name(col) for col in df.columns
-            if col not in ['url_id', 'url', 'title']
-        }, inplace=True)
-        df.to_excel(CONFIG['OUTPUT_FILE'], index=False)
-        print(f"\n✅ Processing complete! Successfully processed {len(results_list)}/{len(read_data)} URLs")
-        print(f"📊 Results saved to {CONFIG['OUTPUT_FILE']}")
-    else:
-        print("\n⚠️ No results to save.")
+    
 
 if __name__ == '__main__':
     main()
